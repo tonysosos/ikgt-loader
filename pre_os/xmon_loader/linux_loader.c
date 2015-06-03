@@ -32,8 +32,13 @@
 static multiboot_module_t *get_mbi_module(multiboot_info_t *mbi,
 					  grub_module_index_t midx)
 {
-	if (mbi->mods_count < GRUB_MODULE_COUNT) {
-		print_string("Some modules are missing\n");
+	if (mbi->mods_count == 0) {
+		print_string("At least one module available.\n");
+		return NULL;
+	}
+
+	/* module not exist */
+	if (midx > mbi->mods_count) {
 		return NULL;
 	}
 
@@ -273,39 +278,40 @@ static bool_t expand_linux_image(multiboot_info_t *mbi,
 	 */
 	hdr->setup_hdr.loadflags &= ~FLAG_CAN_USE_HEAP; /* can not use heap */
 
-	/* load initrd and set ramdisk_image and ramdisk_size
-	 *  The initrd should typically be located as high in memory as possible
-	 *
-	 *  check if Linux command line explicitly specified a memory limit
-	 *  TODO: hardcode here to 4GB. (call get_cmdline_str_value() to get
-	 *  "mem=" limit value (not supported right now)
-	 */
-	uint64_t mem_limit = 0x100000000ULL;
-	uint64_t max_ram_base, max_ram_size;
+	if ((initrd_image !=  0) && (initrd_size != 0)) {
+		/* load initrd and set ramdisk_image and ramdisk_size
+		 *  The initrd should typically be located as high in memory as possible
+		 *
+		 *  check if Linux command line explicitly specified a memory limit
+		 *  TODO: hardcode here to 4GB. (call get_cmdline_str_value() to get
+		 *  "mem=" limit value (not supported right now)
+		 */
+		uint64_t mem_limit = 0x100000000ULL;
+		uint64_t max_ram_base, max_ram_size;
 
-	get_highest_sized_ram(mbi, initrd_size, mem_limit,
-		&max_ram_base, &max_ram_size);
+		get_highest_sized_ram(mbi, initrd_size, mem_limit,
+			&max_ram_base, &max_ram_size);
 
-	if (max_ram_base == 0) {
-		return false;
+		if (max_ram_base == 0) {
+			return false;
+		}
+		if (max_ram_size == 0) {
+			return false;
+		}
+
+		/*
+		 *  try to get the higher part in an AVAILABLE memory range
+		 *  and clear lower 12 bit to make it page-aligned down.
+		 */
+		initrd_base = (max_ram_base + max_ram_size - initrd_size) & (~PAGE_4KB_MASK);
+
+		/* exceed initrd_addr_max specified in vmlinuz header? */
+		if (initrd_base + initrd_size > hdr->setup_hdr.initrd_addr_max) {
+			/* make it much lower, if exceed it */
+			initrd_base = hdr->setup_hdr.initrd_addr_max - initrd_size;
+			initrd_base = initrd_base & (~PAGE_4KB_MASK);
+		}
 	}
-	if (max_ram_size == 0) {
-		return false;
-	}
-
-	/*
-	 *  try to get the higher part in an AVAILABLE memory range
-	 *  and clear lower 12 bit to make it page-aligned down.
-	 */
-	initrd_base = (max_ram_base + max_ram_size - initrd_size) & (~PAGE_4KB_MASK);
-
-	/* exceed initrd_addr_max specified in vmlinuz header? */
-	if (initrd_base + initrd_size > hdr->setup_hdr.initrd_addr_max) {
-		/* make it much lower, if exceed it */
-		initrd_base = hdr->setup_hdr.initrd_addr_max - initrd_size;
-		initrd_base = initrd_base & (~PAGE_4KB_MASK);
-	}
-
 
 
 	if (hdr->setup_hdr.relocatable_kernel) {
@@ -328,21 +334,23 @@ static bool_t expand_linux_image(multiboot_info_t *mbi,
 	}
 
 
+	if ((initrd_image != 0) && (initrd_size != 0)) {
+		/* make sure no overlap between initrd and protected mode kernel code */
+		if ((protected_mode_base + PAGE_ALIGN_4K(prot_size)) > initrd_base) {
+			print_string(
+				"ERROR: Initrd size is too large (or protected mode code size is too large)\n");
+			return false;
+		}
 
-	/* make sure no overlap between initrd and protected mode kernel code */
-	if ((protected_mode_base + PAGE_ALIGN_4K(prot_size)) > initrd_base) {
-		print_string(
-			"ERROR: Initrd size is too large (or protected mode code size is too large)\n");
-		return false;
+		/* relocate initrd image to higher end location. */
+		mon_memcpy((void *)initrd_base, initrd_image, initrd_size);
+
+		hdr->setup_hdr.ramdisk_image = initrd_base;
+		hdr->setup_hdr.ramdisk_size = initrd_size;
+	} else {
+		hdr->setup_hdr.ramdisk_image = 0;
+		hdr->setup_hdr.ramdisk_size = 0;
 	}
-
-
-	/* relocate initrd image to higher end location. */
-	mon_memcpy((void *)initrd_base, initrd_image, initrd_size);
-
-
-	hdr->setup_hdr.ramdisk_image = initrd_base;
-	hdr->setup_hdr.ramdisk_size = initrd_size;
 
 
 	hdr->setup_hdr.code32_start = protected_mode_base;
@@ -435,6 +443,8 @@ void launch_linux_kernel(multiboot_info_t *mbi)
 {
 	unsigned int kernel_entry_point;
 	unsigned int boot_param_addr;
+	void *initrd_image;
+	size_t initrd_size;
 
 	/* get kernel module */
 	multiboot_module_t *m = get_mbi_module(mbi, MVMLINUZ);
@@ -451,12 +461,12 @@ void launch_linux_kernel(multiboot_info_t *mbi)
 	/* get initrd module */
 	m = get_mbi_module(mbi, MINITRD);
 	if (m == NULL) {
-		print_string("ERROR: get initrd module failed\n");
-		return;
+		initrd_image = 0;
+		initrd_size = 0;
+	} else {
+		initrd_image = (void *)m->mod_start;
+		initrd_size = m->mod_end - m->mod_start;
 	}
-
-	void *initrd_image = (void *)m->mod_start;
-	size_t initrd_size = m->mod_end - m->mod_start;
 
 	if (false == expand_linux_image(mbi,
 		    kernel_image, kernel_size,
